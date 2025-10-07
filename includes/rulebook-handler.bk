@@ -1,0 +1,196 @@
+<?php
+
+
+if (!defined('ABSPATH')) exit;
+
+/** CONFIG **/
+define('H64_PROTECTED_DIR', WP_CONTENT_DIR . '/uploads/protected');
+define('H64_PROTECTED_FILE', 'ARDEVUR_Digital_Rulebook.pdf');
+define('H64_DOWNLOAD_SLUG', 'download-rulebook');
+define('H64_RULEBOOK_TEMPLATE_ID', 14); // Brevo Template ID
+
+/**
+ * Shared handler (used by Elementor form submission)
+ */
+function h64_process_submission($email, $name, $consent) {
+    if (!$email || !is_email($email)) {
+        return new WP_Error('invalid_email', 'Invalid email');
+    }
+
+    // Generate token + record
+    $token = bin2hex(random_bytes(16));
+    $record = [
+        'email'   => $email,
+        'name'    => $name,
+        'consent' => $consent,
+        'used'    => false,
+        'file'    => trailingslashit(H64_PROTECTED_DIR) . H64_PROTECTED_FILE,
+    ];
+    add_option('h64_'.$token, $record, '', false);
+
+    // Build secure download link
+    $link = add_query_arg('token', $token, home_url('/'.H64_DOWNLOAD_SLUG.'/'));
+
+    // Send transactional email
+    $resp = h64_send_brevo_template($email, $name, $link, $consent);
+
+    // Save contact
+    h64_add_brevo_contact($email, $name, $consent);
+
+    if (is_wp_error($resp)) {
+        error_log('H64 Rulebook: Brevo send failed - ' . $resp->get_error_message());
+        return $resp;
+    }
+
+    error_log('H64 Rulebook: Email queued for ' . $email);
+    return ['ok'=>true,'link'=>$link];
+}
+
+/**
+ * Hook into Elementor form submission
+ */
+add_action('elementor_pro/forms/new_record', function($record, $handler) {
+    $form_name = $record->get_form_settings('form_name');
+    $form_id = $record->get_form_settings('form_id');
+    if ($form_name !== 'rulebook_form' && $form_id !== 345) { // Replace with your Elementor form name or ID
+        return;
+    }
+
+    $raw_fields = $record->get('fields');
+    $data = [];
+    foreach ($raw_fields as $id => $field) {
+        $data[$id] = sanitize_text_field($field['value']);
+    }
+
+    $email   = sanitize_email($data['email'] ?? '');
+    $name    = sanitize_text_field($data['name'] ?? '');
+    $consent = sanitize_text_field($data['consent'] ?? '');
+
+    h64_process_submission($email, $name, $consent);
+}, 10, 2);
+
+/**
+ * Send using Brevo Template
+ */
+function h64_send_brevo_template($to, $name, $link, $consent) {
+    $endpoint = 'https://api.brevo.com/v3/smtp/email';
+    $body = [
+        'to' => [[
+            'email' => $to,
+            'name'  => $name
+        ]],
+        'templateId' => H64_RULEBOOK_TEMPLATE_ID,
+        'params' => [
+            'FIRSTNAME'     => $name,
+            'DOWNLOAD_LINK' => $link,
+            'CONSENT'       => $consent,
+        ]
+    ];
+
+    $res = wp_remote_post($endpoint, [
+        'headers'=>[
+            'Content-Type'=>'application/json',
+            'api-key'=>H64_BREVO_API_KEY // from wp-config.php
+        ],
+        'body'=>wp_json_encode($body),
+        'timeout'=>20,
+    ]);
+
+    if (is_wp_error($res)) return $res;
+    $code = wp_remote_retrieve_response_code($res);
+    if ($code < 200 || $code >= 300) {
+        return new WP_Error('brevo','HTTP '.$code.' '.wp_remote_retrieve_body($res));
+    }
+    return true;
+}
+
+
+/**
+ * Add or update contact in Brevo
+ */
+function h64_add_brevo_contact($email, $name, $consent) {
+    $endpoint = 'https://api.brevo.com/v3/contacts';
+
+    // Split name into first and last (simple split)
+    $parts = explode(' ', $name, 2);
+    $firstName = $parts[0] ?? '';
+    $lastName  = $parts[1] ?? '';
+
+    $body = [
+        'email' => $email,
+        'attributes' => [
+            'FIRSTNAME' => $firstName,
+            'LASTNAME'  => $lastName,
+            'CONSENT'   => $consent,
+        ],
+        // Optionally add to a list (replace with your Brevo List ID)
+        'listIds' => [10],
+        'updateEnabled' => true
+    ];
+
+    $res = wp_remote_post($endpoint, [
+        'headers'=>[
+            'Content-Type'=>'application/json',
+            'api-key'=>H64_BREVO_API_KEY // from wp-config.php
+        ],
+        'body'=>wp_json_encode($body),
+        'timeout'=>20,
+    ]);
+
+    if (is_wp_error($res)) {
+        error_log('H64 Rulebook: Brevo contact add failed - ' . $res->get_error_message());
+        return;
+    }
+
+    $code = wp_remote_retrieve_response_code($res);
+    if ($code < 200 || $code >= 300) {
+        error_log('H64 Rulebook: Brevo contact API error ' . $code . ' - ' . wp_remote_retrieve_body($res));
+    } else {
+        error_log('H64 Rulebook: Contact saved to Brevo - ' . $email);
+    }
+}
+
+/**
+ * Handle download page
+ */
+add_action('template_redirect', function () {
+    if (!is_page(H64_DOWNLOAD_SLUG)) return;
+
+    $token = sanitize_text_field($_GET['token'] ?? '');
+    if (!$token) h64_error('Missing token');
+
+    $rec = get_option('h64_'.$token);
+
+    // One-time-use token
+    if (!$rec) h64_error('Invalid or expired link');
+    if (!empty($rec['used'])) h64_error('This link has already been used');
+
+    $file = $rec['file'];
+    if (!file_exists($file)) h64_error('File not found');
+
+    // Mark token as used (only after checks passed)
+    $rec['used'] = true;
+    update_option('h64_'.$token, $rec, false);
+
+    nocache_headers();
+    header('Content-Type: application/pdf');
+    header('Content-Disposition: attachment; filename="'.basename($file).'"');
+    readfile($file);
+    exit;
+});
+
+function h64_error($msg) {
+    status_header(403);
+    wp_die('<p>'.esc_html($msg).'</p>', 'Download Error', ['response'=>403]);
+}
+
+/**
+ * Deny direct access to protected files via .htaccess
+ */
+add_action('init', function () {
+    $htaccess_path = trailingslashit(H64_PROTECTED_DIR) . '.htaccess';
+    if (!file_exists($htaccess_path)) {
+        $rules = "Order deny,allow\nDeny from all";
+        file_put_contents($htaccess_path, $rules);
+    }
+});
